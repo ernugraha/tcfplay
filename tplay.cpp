@@ -7,13 +7,10 @@
  *   g++ -O2 -std=c++11 -o tplay tplay.cpp -lncursesw -lpthread
  */
 
-// Enable wide-character ncurses BEFORE including any ncurses header
 #define _XOPEN_SOURCE_EXTENDED 1
 #include <ncursesw/ncurses.h>
-
 #include <locale.h>
 #include <wchar.h>
-
 #include <string>
 #include <vector>
 #include <cstdio>
@@ -25,29 +22,21 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <pthread.h>
-#include <cerrno>
 #include <algorithm>
 #include <sstream>
 #include <time.h>
 
-// ─── Unicode / display-width helpers ────────────────────────────────────────
-//
-// East-Asian fullwidth characters (CJK, Kana, Hangul) occupy 2 terminal
-// columns each. We need the *display width* of a UTF-8 string to truncate
-// it correctly without breaking multi-byte sequences or misaligning layout.
-//
-// wcswidth() from <wchar.h> gives us this for a wchar_t string.
+// ─── Unicode helpers ──────────────────────────────────────────────────────────
 
 static std::wstring utf8_to_wcs(const std::string& s) {
     std::wstring ws;
     const char* src = s.c_str();
-    size_t len = s.size();
-    size_t i = 0;
+    size_t len = s.size(), i = 0;
     while (i < len) {
         wchar_t wc = 0;
-        int bytes = mbtowc(&wc, src + i, len - i);
-        if (bytes <= 0) { ws += L'?'; i++; }
-        else            { ws += wc;   i += bytes; }
+        int b = mbtowc(&wc, src + i, len - i);
+        if (b <= 0) { ws += L'?'; i++; }
+        else        { ws += wc;   i += b; }
     }
     return ws;
 }
@@ -58,40 +47,23 @@ static int display_width(const std::string& s) {
     return (w < 0) ? (int)ws.size() : w;
 }
 
-// Truncate UTF-8 string to at most max_w display columns, appending suffix.
 static std::string trunc_display(const std::string& s, int max_w,
-                                  const std::string& suffix = "...") {
-    int sw = display_width(s);
-    if (sw <= max_w) return s;
-
-    int suffix_w = display_width(suffix);
-    int target   = max_w - suffix_w;
-    if (target <= 0) return suffix.substr(0, max_w);
-
-    std::wstring ws = utf8_to_wcs(s);
-    std::wstring result;
+                                  const std::string& suf = "...") {
+    if (display_width(s) <= max_w) return s;
+    int target = max_w - display_width(suf);
+    if (target <= 0) return suf.substr(0, max_w);
+    std::wstring ws = utf8_to_wcs(s), res;
     int acc = 0;
     for (wchar_t wc : ws) {
-        int cw = wcwidth(wc);
-        if (cw < 0) cw = 1;
+        int cw = wcwidth(wc); if (cw < 0) cw = 1;
         if (acc + cw > target) break;
-        result += wc;
-        acc += cw;
+        res += wc; acc += cw;
     }
-
-    // Convert result wstring back to UTF-8
-    std::string out;
-    char mb[MB_CUR_MAX + 1];
-    for (wchar_t wc : result) {
-        int n = wctomb(mb, wc);
-        if (n > 0) out.append(mb, n);
-    }
-    out += suffix;
-    return out;
+    std::string out; char mb[MB_CUR_MAX + 1];
+    for (wchar_t wc : res) { int n = wctomb(mb, wc); if (n > 0) out.append(mb, n); }
+    return out + suf;
 }
 
-// Width-aware mvaddstr: ncursesw's mvaddstr handles multi-byte UTF-8
-// correctly once setlocale() has been called.
 static void mvaddutf8(int row, int col, const std::string& s) {
     mvaddstr(row, col, s.c_str());
 }
@@ -100,31 +72,45 @@ static void mvaddutf8(int row, int col, const std::string& s) {
 
 struct Chapter {
     std::string title;
-    double start_time;
-    double end_time;
+    double start_time, end_time;
 };
 
 struct PlayerState {
-    std::string filepath;
-    std::string filename;
-    double duration;
-    double position;
+    std::string filepath, filename;
+    double duration, position;
     int    current_chapter;
     std::vector<Chapter> chapters;
-    bool   playing;
+    bool   playing;          // false = paused
     bool   quit;
     pid_t  ffplay_pid;
+    int    volume;           // 0–100, passed to ffplay -volume
     pthread_mutex_t lock;
 };
 
 static PlayerState G;
 static volatile bool g_resize = false;
 
+// Wall-clock for position estimation
 struct PlayClock {
-    double      start_pos;
+    double          start_pos;
     struct timespec start_wall;
+    // When paused: we record the position at pause time and stop advancing
+    bool            paused;
+    double          pause_pos;
 };
 static PlayClock PC;
+
+// Volume debounce: after last volume keypress, wait 500ms before restarting
+static struct timespec g_vol_dirty = {0, 0};   // time of last vol change
+static bool            g_vol_pending = false;  // restart needed?
+
+// ─── Time helpers ─────────────────────────────────────────────────────────────
+
+static double mono_now() {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return t.tv_sec + t.tv_nsec / 1e9;
+}
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -135,9 +121,7 @@ static std::string basename_of(const std::string& path) {
 
 static std::string fmt_time(double secs) {
     if (secs < 0) secs = 0;
-    int h = (int)secs / 3600;
-    int m = ((int)secs % 3600) / 60;
-    int s = (int)secs % 60;
+    int h = (int)secs / 3600, m = ((int)secs % 3600) / 60, s = (int)secs % 60;
     char buf[32];
     if (h > 0) snprintf(buf, sizeof(buf), "%d:%02d:%02d", h, m, s);
     else        snprintf(buf, sizeof(buf), "%d:%02d", m, s);
@@ -147,15 +131,12 @@ static std::string fmt_time(double secs) {
 // ─── Media probing ────────────────────────────────────────────────────────────
 
 static bool probe_media(const std::string& path,
-                        double& duration,
-                        std::vector<Chapter>& chapters)
+                        double& duration, std::vector<Chapter>& chapters)
 {
-    // Duration
     {
-        std::string cmd =
-            "ffprobe -v quiet -show_entries format=duration "
-            "-of default=noprint_wrappers=1:nokey=1 \""
-            + path + "\" 2>/dev/null";
+        std::string cmd = "ffprobe -v quiet -show_entries format=duration "
+                          "-of default=noprint_wrappers=1:nokey=1 \""
+                          + path + "\" 2>/dev/null";
         FILE* f = popen(cmd.c_str(), "r");
         if (!f) return false;
         char buf[64] = {0};
@@ -164,26 +145,20 @@ static bool probe_media(const std::string& path,
     }
     if (duration <= 0) return false;
 
-    // Chapters — CSV: chapter,index,time_base,start,start_time,end,end_time[,title,...]
     {
-        std::string cmd =
-            "ffprobe -v quiet -print_format csv -show_chapters \""
-            + path + "\" 2>/dev/null";
+        std::string cmd = "ffprobe -v quiet -print_format csv -show_chapters \""
+                          + path + "\" 2>/dev/null";
         FILE* f = popen(cmd.c_str(), "r");
         if (!f) return true;
-
         char line[2048];
         while (fgets(line, sizeof(line), f)) {
             if (strncmp(line, "chapter,", 8) != 0) continue;
             std::string s(line);
             while (!s.empty() && (s.back()=='\n'||s.back()=='\r')) s.pop_back();
-
             std::vector<std::string> parts;
-            std::stringstream ss(s);
-            std::string tok;
+            std::stringstream ss(s); std::string tok;
             while (std::getline(ss, tok, ',')) parts.push_back(tok);
             if (parts.size() < 7) continue;
-
             Chapter ch;
             ch.start_time = atof(parts[4].c_str());
             ch.end_time   = atof(parts[6].c_str());
@@ -207,13 +182,12 @@ static int find_chapter(const std::vector<Chapter>& chs, double pos) {
     return 0;
 }
 
-// ─── ffplay process management ───────────────────────────────────────────────
+// ─── ffplay management ────────────────────────────────────────────────────────
 
 static void kill_ffplay() {
     if (G.ffplay_pid > 0) {
         kill(G.ffplay_pid, SIGTERM);
-        int st;
-        waitpid(G.ffplay_pid, &st, 0);
+        int st; waitpid(G.ffplay_pid, &st, 0);
         G.ffplay_pid = -1;
     }
 }
@@ -226,23 +200,28 @@ static void spawn_ffplay(double seek_pos) {
         dup2(devnull, STDOUT_FILENO);
         dup2(devnull, STDERR_FILENO);
         close(devnull);
-        char ss_buf[32];
-        snprintf(ss_buf, sizeof(ss_buf), "%.2f", seek_pos);
-        // -nodisp  : no video window at all, even for .mp4/.mkv
-        // -autoexit: quit when stream ends
+        char ss_buf[32], vol_buf[16];
+        snprintf(ss_buf,  sizeof(ss_buf),  "%.2f", seek_pos);
+        snprintf(vol_buf, sizeof(vol_buf), "%d",   G.volume);
+        // -nodisp  : audio only, no video window (even for .mp4/.mkv)
+        // -autoexit: exit when stream ends
+        // -volume  : 0–100, internal ffplay volume (does NOT touch system mixer)
         execlp("ffplay", "ffplay",
                "-nodisp", "-autoexit",
                "-ss", ss_buf,
+               "-volume", vol_buf,
                G.filepath.c_str(),
                (char*)NULL);
         _exit(1);
     }
-    G.ffplay_pid    = pid;
-    PC.start_pos    = seek_pos;
+    G.ffplay_pid     = pid;
+    PC.start_pos     = seek_pos;
+    PC.paused        = false;
     clock_gettime(CLOCK_MONOTONIC, &PC.start_wall);
 }
 
 static double estimated_position() {
+    if (PC.paused) return PC.pause_pos;
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
     double elapsed = (now.tv_sec  - PC.start_wall.tv_sec)
@@ -252,7 +231,93 @@ static double estimated_position() {
     return pos;
 }
 
+// ─── Pause / resume ───────────────────────────────────────────────────────────
+//
+// SIGSTOP freezes the ffplay process at the OS level — zero CPU, audio stops
+// instantly. SIGCONT resumes it. No restart needed, no audio glitch.
+// We also freeze the wall-clock estimator so the progress bar does not drift.
+
+static void do_pause() {
+    if (G.ffplay_pid <= 0) return;
+    PC.pause_pos = estimated_position();
+    PC.paused    = true;
+    kill(G.ffplay_pid, SIGSTOP);
+    G.playing = false;
+}
+
+static void do_resume() {
+    if (G.ffplay_pid <= 0) return;
+    // Re-anchor the wall clock to now so estimation stays accurate
+    PC.start_pos = PC.pause_pos;
+    clock_gettime(CLOCK_MONOTONIC, &PC.start_wall);
+    PC.paused    = false;
+    kill(G.ffplay_pid, SIGCONT);
+    G.playing = true;
+}
+
+static void do_toggle_pause() {
+    if (G.playing) do_pause();
+    else           do_resume();
+}
+
+// ─── Seek ─────────────────────────────────────────────────────────────────────
+
+static void do_seek(double new_pos) {
+    if (new_pos < 0)          new_pos = 0;
+    if (new_pos > G.duration) new_pos = G.duration;
+    G.position        = new_pos;
+    G.current_chapter = find_chapter(G.chapters, new_pos);
+    spawn_ffplay(new_pos);
+    // Respect paused state: if we were paused, immediately re-pause new child
+    if (!G.playing) {
+        // Give ffplay a moment to start before stopping it
+        usleep(80000);
+        do_pause();
+    }
+}
+
+// ─── Volume ───────────────────────────────────────────────────────────────────
+//
+// We change G.volume and mark a pending restart. The main loop restarts ffplay
+// once 500ms of silence (no more vol keypresses) has passed. This way rapid
+// key-holds only cause one restart at the end, not one per frame.
+
+static void do_volume_change(int delta) {
+    G.volume += delta;
+    if (G.volume < 0)   G.volume = 0;
+    if (G.volume > 100) G.volume = 100;
+    // Record time of this change for debounce
+    clock_gettime(CLOCK_MONOTONIC, &g_vol_dirty);
+    g_vol_pending = true;
+}
+
+// Called from main loop: apply volume restart if debounce period has elapsed
+static void maybe_apply_volume() {
+    if (!g_vol_pending) return;
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    double age = (now.tv_sec  - g_vol_dirty.tv_sec)
+               + (now.tv_nsec - g_vol_dirty.tv_nsec) / 1e9;
+    if (age < 0.5) return;  // still within debounce window
+
+    g_vol_pending = false;
+    double pos = estimated_position();
+    spawn_ffplay(pos);
+    if (!G.playing) {
+        usleep(80000);
+        do_pause();
+    }
+}
+
 // ─── UI ───────────────────────────────────────────────────────────────────────
+//
+// Color pairs:
+//   1 = cyan   — title bar, playhead
+//   2 = green  — filled progress bar
+//   3 = white  — empty bar, inactive items
+//   4 = yellow — active chapter, chapter markers, volume bar
+//   5 = white  — time info, hints
+//   6 = red    — PAUSED indicator
 
 static void draw_ui() {
     int rows, cols;
@@ -262,34 +327,34 @@ static void draw_ui() {
 
     double pos = G.position;
 
-    // Row 0: title
+    // ── Row 0: title + pause/play indicator ──────────────────────────────────
     attron(COLOR_PAIR(1) | A_BOLD);
     mvhline(0, 0, ' ', cols);
-    std::string title = " * " + G.filename;
+    // Status tag on the left: "[||]" paused or "[>]" playing
+    std::string status = G.playing ? " [>] " : " [||] ";
+    std::string title  = status + G.filename;
     mvaddutf8(0, 0, trunc_display(title, cols - 1));
     attroff(COLOR_PAIR(1) | A_BOLD);
 
-    // Row 1: time + current chapter name
+    // ── Row 1: time + chapter name ────────────────────────────────────────────
     std::string time_str = " " + fmt_time(pos) + " / " + fmt_time(G.duration);
     attron(COLOR_PAIR(5));
     mvaddutf8(1, 0, time_str);
     if (!G.chapters.empty() && G.current_chapter >= 0) {
         const Chapter& c = G.chapters[G.current_chapter];
-        std::string ch_str =
-            "[" + std::to_string(G.current_chapter + 1) + "/"
+        std::string ch_str = "[" + std::to_string(G.current_chapter + 1) + "/"
             + std::to_string((int)G.chapters.size()) + "] " + c.title;
         int avail = cols - display_width(time_str) - 3;
         if (avail > 4) {
-            ch_str    = trunc_display(ch_str, avail);
-            int ch_w  = display_width(ch_str);
-            int x     = cols - ch_w - 1;
+            ch_str = trunc_display(ch_str, avail);
+            int x  = cols - display_width(ch_str) - 1;
             if (x > display_width(time_str) + 2)
                 mvaddutf8(1, x, ch_str);
         }
     }
     attroff(COLOR_PAIR(5));
 
-    // Row 2: progress bar
+    // ── Row 2: progress bar ───────────────────────────────────────────────────
     int bar_x = 1, bar_w = cols - 2;
     if (bar_w > 0 && G.duration > 0) {
         double frac  = pos / G.duration;
@@ -297,16 +362,12 @@ static void draw_ui() {
         int filled = (int)(frac * bar_w);
 
         attron(COLOR_PAIR(2));
-        for (int i = 0; i < filled && i < bar_w; i++)
-            mvaddch(2, bar_x + i, ACS_BLOCK);
+        for (int i = 0; i < filled && i < bar_w; i++) mvaddch(2, bar_x+i, ACS_BLOCK);
         attroff(COLOR_PAIR(2));
-
         attron(COLOR_PAIR(3));
-        for (int i = filled; i < bar_w; i++)
-            mvaddch(2, bar_x + i, ACS_HLINE);
+        for (int i = filled; i < bar_w; i++) mvaddch(2, bar_x+i, ACS_HLINE);
         attroff(COLOR_PAIR(3));
 
-        // Chapter boundary markers
         for (const auto& ch : G.chapters) {
             if (ch.start_time <= 0) continue;
             int mx = bar_x + (int)(ch.start_time / G.duration * bar_w);
@@ -317,7 +378,6 @@ static void draw_ui() {
             }
         }
 
-        // Playhead
         int thumb = bar_x + filled;
         if (thumb >= bar_x + bar_w) thumb = bar_x + bar_w - 1;
         attron(COLOR_PAIR(1) | A_BOLD);
@@ -325,9 +385,40 @@ static void draw_ui() {
         attroff(COLOR_PAIR(1) | A_BOLD);
     }
 
-    // Rows 3+: chapter list
-    int list_row = 3;
-    if (!G.chapters.empty() && rows > 7) {
+    // ── Row 3: volume bar ─────────────────────────────────────────────────────
+    {
+        // "VOL [########··········] 75%"
+        // Fits in one line, always visible
+        int vol_bar_w = cols / 3;
+        if (vol_bar_w < 10) vol_bar_w = 10;
+        if (vol_bar_w > 30) vol_bar_w = 30;
+        int filled_v = (int)((double)G.volume / 100.0 * vol_bar_w);
+
+        char vol_pct[16];
+        snprintf(vol_pct, sizeof(vol_pct), " %3d%%", G.volume);
+
+        std::string vol_label = " VOL [";
+        attron(COLOR_PAIR(5));
+        mvaddstr(3, 0, vol_label.c_str());
+        attroff(COLOR_PAIR(5));
+
+        int vx = (int)vol_label.size();
+        attron(COLOR_PAIR(4));
+        for (int i = 0; i < filled_v; i++)   mvaddch(3, vx+i, ACS_BLOCK);
+        attroff(COLOR_PAIR(4));
+        attron(COLOR_PAIR(3));
+        for (int i = filled_v; i < vol_bar_w; i++) mvaddch(3, vx+i, '.');
+        attroff(COLOR_PAIR(3));
+
+        attron(COLOR_PAIR(5));
+        mvaddch(3, vx + vol_bar_w, ']');
+        mvaddstr(3, vx + vol_bar_w + 1, vol_pct);
+        attroff(COLOR_PAIR(5));
+    }
+
+    // ── Rows 4+: chapter list ─────────────────────────────────────────────────
+    int list_row = 4;
+    if (!G.chapters.empty() && rows > 9) {
         attron(COLOR_PAIR(5));
         mvaddstr(list_row++, 0, " Chapters:");
         attroff(COLOR_PAIR(5));
@@ -342,13 +433,11 @@ static void draw_ui() {
              i++, list_row++)
         {
             bool active = (i == G.current_chapter);
-            std::string entry =
-                (active ? " > " : "   ")
-                + std::to_string(i + 1) + ". "
+            std::string entry = (active ? " > " : "   ")
+                + std::to_string(i+1) + ". "
                 + G.chapters[i].title
                 + "  [" + fmt_time(G.chapters[i].start_time) + "]";
             entry = trunc_display(entry, cols - 1);
-
             if (active) attron(COLOR_PAIR(4) | A_BOLD);
             else        attron(COLOR_PAIR(3));
             mvhline(list_row, 0, ' ', cols);
@@ -358,26 +447,16 @@ static void draw_ui() {
         }
     }
 
-    // Bottom row: key hints
+    // ── Bottom row: key hints ─────────────────────────────────────────────────
     std::string hints = G.chapters.empty()
-        ? " [<-/->] seek 10s   [q] quit"
-        : " [<-/->] seek 10s   [i] next ch   [k] prev ch   [q] quit";
+        ? " [<-/->] seek  [^/v] volume  [space] pause  [q] quit"
+        : " [<-/->] seek  [^/v] volume  [space] pause  [i/k] chapter  [q] quit";
     attron(COLOR_PAIR(5));
-    mvhline(rows - 1, 0, ' ', cols);
-    mvaddstr(rows - 1, 0, trunc_display(hints, cols - 1).c_str());
+    mvhline(rows-1, 0, ' ', cols);
+    mvaddstr(rows-1, 0, trunc_display(hints, cols-1).c_str());
     attroff(COLOR_PAIR(5));
 
     refresh();
-}
-
-// ─── Seek ─────────────────────────────────────────────────────────────────────
-
-static void do_seek(double new_pos) {
-    if (new_pos < 0)          new_pos = 0;
-    if (new_pos > G.duration) new_pos = G.duration;
-    G.position        = new_pos;
-    G.current_chapter = find_chapter(G.chapters, new_pos);
-    spawn_ffplay(new_pos);
 }
 
 // ─── Signal handlers ─────────────────────────────────────────────────────────
@@ -402,8 +481,6 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // Must be called BEFORE ncurses init.
-    // This enables UTF-8 / multi-byte (Japanese, CJK, etc.) throughout.
     setlocale(LC_ALL, "");
 
     if (system("which ffplay >/dev/null 2>&1") != 0) {
@@ -413,6 +490,8 @@ int main(int argc, char* argv[]) {
 
     memset(&G, 0, sizeof(G));
     G.ffplay_pid = -1;
+    G.volume     = 100;
+    G.playing    = true;
     pthread_mutex_init(&G.lock, NULL);
     G.filepath = argv[1];
     G.filename = basename_of(G.filepath);
@@ -432,26 +511,25 @@ int main(int argc, char* argv[]) {
     }
 
     G.current_chapter = 0;
-    G.playing         = true;
     G.position        = 0.0;
 
-    // ncursesw init — respects the LC_ALL locale set above
     initscr();
     cbreak();
     noecho();
     keypad(stdscr, TRUE);
     curs_set(0);
     nodelay(stdscr, TRUE);
-    timeout(200);   // 5 redraws/second — easy on old CPUs
+    timeout(200);
 
     if (has_colors()) {
         start_color();
         use_default_colors();
-        init_pair(1, COLOR_CYAN,   -1);  // title bar / thumb
-        init_pair(2, COLOR_GREEN,  -1);  // filled bar
-        init_pair(3, COLOR_WHITE,  -1);  // empty bar / inactive items
-        init_pair(4, COLOR_YELLOW, -1);  // active chapter / markers
-        init_pair(5, COLOR_WHITE,  -1);  // time / hints
+        init_pair(1, COLOR_CYAN,   -1);  // title / thumb
+        init_pair(2, COLOR_GREEN,  -1);  // filled progress
+        init_pair(3, COLOR_WHITE,  -1);  // empty / inactive
+        init_pair(4, COLOR_YELLOW, -1);  // volume / active chapter / markers
+        init_pair(5, COLOR_WHITE,  -1);  // text / hints
+        init_pair(6, COLOR_RED,    -1);  // (reserved for future use)
     }
 
     signal(SIGWINCH, handle_sigwinch);
@@ -460,16 +538,18 @@ int main(int argc, char* argv[]) {
     spawn_ffplay(0.0);
 
     while (!G.quit) {
+        // Update position estimate (only when playing)
         if (G.ffplay_pid > 0) {
             G.position        = estimated_position();
             G.current_chapter = find_chapter(G.chapters, G.position);
         }
 
+        // Apply pending volume change after debounce
+        maybe_apply_volume();
+
         if (g_resize) {
             g_resize = false;
-            endwin();
-            refresh();
-            clear();
+            endwin(); refresh(); clear();
         }
 
         draw_ui();
@@ -478,9 +558,24 @@ int main(int argc, char* argv[]) {
         if (ch == ERR) continue;
 
         switch (ch) {
-            case 'q': case 'Q': G.quit = true; break;
-            case KEY_RIGHT:     do_seek(G.position + 10.0); break;
-            case KEY_LEFT:      do_seek(G.position - 10.0); break;
+            case 'q': case 'Q':
+                G.quit = true;
+                break;
+            case ' ':
+                do_toggle_pause();
+                break;
+            case KEY_RIGHT:
+                do_seek(G.position + 10.0);
+                break;
+            case KEY_LEFT:
+                do_seek(G.position - 10.0);
+                break;
+            case KEY_UP:
+                do_volume_change(+5);
+                break;
+            case KEY_DOWN:
+                do_volume_change(-5);
+                break;
             case 'i': case 'I':
                 if (!G.chapters.empty()) {
                     int nx = G.current_chapter + 1;
