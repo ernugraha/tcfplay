@@ -1,5 +1,5 @@
-# TCF — Terminal Media Player
-**T**he **C**ringe **F**u**ing Media Player
+# TCF — Terminal Audio Player
+The Chapter Free Music Player
 
 A lightweight terminal audio player powered by ffplay.
 Designed to run comfortably on old hardware (2011 PCs and up).
@@ -12,22 +12,13 @@ are fully supported.
 
 ## UI layout
 
-```
- * 夜に駆ける.m4a
- 3:42 / 12:30                          [2/5] 第二章 - Bridge
- XXXXXXXXXXXXXXXX|──────────────────────────O─────────────────
- Chapters:
-   1. Intro             [0:00]
- > 2. 第二章 - Bridge   [3:30]
-   3. Chorus            [7:00]
-   4. Outro             [11:00]
- [<-/->] seek 10s   [s] next ch   [w] prev ch   [q] quit
-```
+![Screenshot](/screenshot.png)
 
 - Top bar: filename (safely truncated for wide CJK characters)
 - Second row: elapsed / total time, current chapter on the right
 - Progress bar: filled blocks, chapter markers `|`, playhead `O`
 - Chapter list: scrolls to keep the active entry visible
+- Visualizer: show spectrum visualizer if no chapter on media
 - Bottom bar: key hints
 
 ## Requirements
@@ -42,9 +33,10 @@ are fully supported.
 
 ### Debian / Ubuntu
 ```bash
-sudo apt install ffmpeg libncursesw5-dev g++
+sudo apt install git ffmpeg libncursesw5-dev g++
+git clone https://github.com/ernugraha/tcfplay.git
 make
-sudo make install   # optional: copies tplay to /usr/local/bin
+sudo make install   # optional: copies tcfplay to /usr/local/bin
 ```
 
 ### Arch Linux
@@ -67,10 +59,10 @@ g++ -O2 -std=c++11 -o tplay tplay.cpp -lncursesw -lpthread
 ## Usage
 
 ```bash
-./tplay song.mp3
-./tplay podcast.m4a
-./tplay movie.mp4        # audio only — no video window
-./tplay 夜に駆ける.flac   # Japanese filenames work fine
+./tcfplay song.mp3
+./tcfplay podcast.m4a
+./tcfplay movie.mp4        # audio only — no video window
+./tcfplay 夜に駆ける.flac   # Japanese filenames work fine
 ```
 
 ## Controls
@@ -80,7 +72,7 @@ g++ -O2 -std=c++11 -o tplay tplay.cpp -lncursesw -lpthread
 | `→` Right arrow | Seek forward 10 seconds |
 | `←` Left arrow  | Seek backward 10 seconds |
 | `s` | Jump to next chapter |
-| `k` | Jump to previous chapter |
+| `w` | Jump to previous chapter |
 | `q` | Quit |
 
 ## Why it is light on old hardware
