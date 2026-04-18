@@ -371,8 +371,12 @@ static void start_viz(double seek_pos) {
         snprintf(ss_buf, sizeof(ss_buf), "%.2f", seek_pos);
 
         // Decode to raw PCM: 8kHz mono s16le
-        // -vn: skip video streams (faster startup)
+        // -re: read input at real-time speed — without this ffmpeg dumps
+        //      the entire file instantly, pipe fills up, and the thread
+        //      reads a few chunks then hits EOF and dies.
+        // -vn: skip video streams
         execlp("ffmpeg", "ffmpeg",
+               "-re",
                "-ss", ss_buf,
                "-i", G.filepath.c_str(),
                "-vn",
