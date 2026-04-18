@@ -21,6 +21,7 @@
 #include <unistd.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
+#include <sys/select.h>
 #include <fcntl.h>
 #include <pthread.h>
 #include <algorithm>
@@ -71,10 +72,9 @@ static void mvaddutf8(int row, int col, const std::string& s) {
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
-#define NUM_BANDS     10
-#define VIZ_SAMPLERATE 8000   // Hz — low rate keeps CPU tiny
-#define VIZ_CHANNELS   1
-#define VIZ_CHUNK      512    // samples per read
+#define NUM_BANDS      10
+#define VIZ_SR         8000    // sample rate for visualizer ffmpeg process
+#define VIZ_CHUNK      512     // samples per processing block
 
 // ─── Structs ──────────────────────────────────────────────────────────────────
 
@@ -95,14 +95,13 @@ struct PlayerState {
     pthread_mutex_t lock;
 };
 
-// Visualizer state — written by viz thread, read by UI thread
 struct VizState {
-    float        bands[NUM_BANDS];   // 0.0–1.0 per band
-    float        peaks[NUM_BANDS];   // peak hold, decays over time
+    float           bands[NUM_BANDS];
+    float           peaks[NUM_BANDS];
     pthread_mutex_t mu;
-    pid_t        ffmpeg_pid;
-    int          pipe_fd;            // read end of PCM pipe
-    bool         running;
+    pid_t           ffmpeg_pid;
+    int             pipe_fd;
+    volatile bool   running;
 };
 
 static PlayerState G;
@@ -117,7 +116,7 @@ struct PlayClock {
 };
 static PlayClock PC;
 
-static struct timespec g_vol_dirty  = {0, 0};
+static struct timespec g_vol_dirty   = {0, 0};
 static bool            g_vol_pending = false;
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -129,7 +128,7 @@ static std::string basename_of(const std::string& path) {
 
 static std::string fmt_time(double secs) {
     if (secs < 0) secs = 0;
-    int h = (int)secs / 3600, m = ((int)secs % 3600) / 60, s = (int)secs % 60;
+    int h = (int)secs/3600, m = ((int)secs%3600)/60, s = (int)secs%60;
     char buf[32];
     if (h > 0) snprintf(buf, sizeof(buf), "%d:%02d:%02d", h, m, s);
     else        snprintf(buf, sizeof(buf), "%d:%02d", m, s);
@@ -185,84 +184,138 @@ static bool probe_media(const std::string& path,
 
 static int find_chapter(const std::vector<Chapter>& chs, double pos) {
     if (chs.empty()) return -1;
-    for (int i = (int)chs.size() - 1; i >= 0; i--)
+    for (int i = (int)chs.size()-1; i >= 0; i--)
         if (pos >= chs[i].start_time) return i;
     return 0;
 }
 
-// ─── Spectrum visualizer thread ───────────────────────────────────────────────
+// ─── Spectrum visualizer ─────────────────────────────────────────────────────
 //
-// A second ffmpeg process decodes the same file to raw PCM (8kHz mono s16le)
-// at the seek position. We read chunks of samples, split them into 10 frequency
-// bands using a simple DFT over the chunk (no external library), and store the
-// per-band RMS in VIZ.bands[]. The UI thread reads those values every 200ms.
+// Method: biquad bandpass IIR filter, one per band.
+// Each filter passes only its center frequency. We compute RMS of the
+// filter output over a block of samples → amplitude of that frequency band.
 //
-// 8kHz mono s16le = 16000 bytes/sec — negligible bandwidth.
-// DFT over 512 samples at 8kHz: N=512 floats, 10 bands — very cheap.
+// This is the standard approach used in hardware EQ and spectrum analyzers.
+// Very cheap: 5 multiplies + 5 adds per sample per band = 50 ops per sample.
+// At 8kHz with 10 bands: 400k ops/sec — trivial even for a 2011 CPU.
 
-// Goertzel algorithm: energy at a single frequency bin.
-// Much cheaper than full FFT when we only need a few bins.
-static float goertzel(const int16_t* samples, int N, float freq, float sr) {
-    float omega  = 2.0f * (float)M_PI * freq / sr;
-    float coeff  = 2.0f * cosf(omega);
-    float s0 = 0, s1 = 0, s2 = 0;
-    for (int i = 0; i < N; i++) {
-        s0 = (float)samples[i] / 32768.0f + coeff * s1 - s2;
-        s2 = s1; s1 = s0;
+struct Biquad {
+    float b0, b1, b2;   // numerator coefficients
+    float a1, a2;       // denominator (a0 normalised to 1)
+    float x1, x2;       // input delay line
+    float y1, y2;       // output delay line
+
+    void init_bandpass(float freq, float sr, float Q) {
+        float omega = 2.0f * (float)M_PI * freq / sr;
+        float alpha = sinf(omega) / (2.0f * Q);
+        float a0    = 1.0f + alpha;
+        b0 =  alpha / a0;
+        b1 =  0.0f;
+        b2 = -alpha / a0;
+        a1 = (-2.0f * cosf(omega)) / a0;
+        a2 = (1.0f - alpha) / a0;
+        x1 = x2 = y1 = y2 = 0.0f;
     }
-    return sqrtf(s1*s1 + s2*s2 - coeff*s1*s2);
-}
 
-// 10 band center frequencies (Hz), covering 100Hz–3400Hz in a log-ish spread
+    // Process one sample, return filtered output
+    inline float process(float x) {
+        float y = b0*x + b1*x1 + b2*x2 - a1*y1 - a2*y2;
+        x2 = x1; x1 = x;
+        y2 = y1; y1 = y;
+        return y;
+    }
+};
+
+// Band center frequencies (Hz), log-spaced 100Hz–3400Hz
 static const float BAND_FREQS[NUM_BANDS] = {
     100, 200, 350, 550, 800, 1100, 1500, 2000, 2700, 3400
+};
+static const char* BAND_LABELS[NUM_BANDS] = {
+    "100","200","350","550","800","1k1","1k5","2k","2k7","3k4"
 };
 
 static void* viz_thread(void* arg) {
     (void)arg;
-    int fd = VIZ.pipe_fd;
 
-    // Smoothing: exponential moving average
-    float smooth[NUM_BANDS]  = {0};
-    float peaks[NUM_BANDS]   = {0};
+    // Initialise one biquad filter per band
+    // Q=1.2: moderate bandwidth, enough separation between adjacent bands
+    Biquad filters[NUM_BANDS];
+    for (int b = 0; b < NUM_BANDS; b++)
+        filters[b].init_bandpass(BAND_FREQS[b], (float)VIZ_SR, 1.2f);
 
-    // Peak decay per update (~200ms)
-    const float PEAK_DECAY = 0.08f;
-    const float SMOOTH_UP  = 0.6f;
-    const float SMOOTH_DN  = 0.25f;
+    float smooth[NUM_BANDS] = {0};
+    float peaks[NUM_BANDS]  = {0};
+
+    const float SMOOTH_UP   = 0.7f;   // fast attack
+    const float SMOOTH_DN   = 0.2f;   // slow release
+    const float PEAK_DECAY  = 0.05f;  // peak dot falls slowly
 
     int16_t buf[VIZ_CHUNK];
+    int fd = VIZ.pipe_fd;
+
+    // Set pipe non-blocking so we can check VIZ.running periodically
+    {
+        int flags = fcntl(fd, F_GETFL, 0);
+        fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    }
 
     while (VIZ.running) {
-        // Read one chunk of PCM samples
+        // Use select() with 100ms timeout so we can check VIZ.running
+        // even when ffmpeg is paused or slow to produce data.
+        int bytes_needed = VIZ_CHUNK * 2;
         int total = 0;
-        while (total < (int)sizeof(buf) && VIZ.running) {
-            int n = read(fd, (char*)buf + total, sizeof(buf) - total);
-            if (n <= 0) goto done;
+        while (total < bytes_needed) {
+            if (!VIZ.running) goto done;
+            fd_set rfds;
+            FD_ZERO(&rfds);
+            FD_SET(fd, &rfds);
+            struct timeval tv = {0, 100000};  // 100ms timeout
+            int ret = select(fd + 1, &rfds, NULL, NULL, &tv);
+            if (ret < 0) goto done;           // fd closed or error
+            if (ret == 0) continue;           // timeout — loop and recheck running
+            int n = read(fd, (char*)buf + total, bytes_needed - total);
+            if (n <= 0) goto done;            // EOF or error
             total += n;
         }
         if (!VIZ.running) break;
 
-        int N = total / 2;  // number of s16 samples
+        int N = total / 2;
 
-        float new_bands[NUM_BANDS];
-        for (int b = 0; b < NUM_BANDS; b++) {
-            float energy = goertzel(buf, N, BAND_FREQS[b], (float)VIZ_SAMPLERATE);
-            // Normalise: typical speech/music energy ~ 0.1–2.0; clamp to 0–1
-            energy = energy * 0.4f;
-            if (energy > 1.0f) energy = 1.0f;
-            new_bands[b] = energy;
+        // Run each sample through all 10 filters, accumulate squared output
+        float sum_sq[NUM_BANDS] = {0};
+        for (int i = 0; i < N; i++) {
+            float x = (float)buf[i] / 32768.0f;
+            for (int b = 0; b < NUM_BANDS; b++) {
+                float y = filters[b].process(x);
+                sum_sq[b] += y * y;
+            }
         }
+
+        // RMS per band
+        float rms[NUM_BANDS];
+        for (int b = 0; b < NUM_BANDS; b++)
+            rms[b] = sqrtf(sum_sq[b] / (float)N);
+
+        // Auto-scale: track running max with slow decay (~23s half-life at
+        // 8kHz/512 = ~15 chunks/sec). This normalises across all loudness levels.
+        static float rmax = 1e-4f;
+        for (int b = 0; b < NUM_BANDS; b++)
+            if (rms[b] > rmax) rmax = rms[b];
+        rmax *= 0.998f;
+        if (rmax < 1e-4f) rmax = 1e-4f;
 
         pthread_mutex_lock(&VIZ.mu);
         for (int b = 0; b < NUM_BANDS; b++) {
-            float alpha = (new_bands[b] > smooth[b]) ? SMOOTH_UP : SMOOTH_DN;
-            smooth[b] = alpha * new_bands[b] + (1.0f - alpha) * smooth[b];
+            float norm  = rms[b] / rmax;
+            if (norm > 1.0f) norm = 1.0f;
+            float alpha = (norm > smooth[b]) ? SMOOTH_UP : SMOOTH_DN;
+            smooth[b]   = alpha * norm + (1.0f - alpha) * smooth[b];
             VIZ.bands[b] = smooth[b];
 
-            // Peak hold + decay
-            if (smooth[b] >= peaks[b]) peaks[b] = smooth[b];
-            else peaks[b] -= PEAK_DECAY * peaks[b];
+            if (smooth[b] >= peaks[b])
+                peaks[b] = smooth[b];
+            else
+                peaks[b] = peaks[b] * (1.0f - PEAK_DECAY);
             if (peaks[b] < 0) peaks[b] = 0;
             VIZ.peaks[b] = peaks[b];
         }
@@ -270,7 +323,6 @@ static void* viz_thread(void* arg) {
     }
 
 done:
-    // Zero out on exit
     pthread_mutex_lock(&VIZ.mu);
     memset(VIZ.bands, 0, sizeof(VIZ.bands));
     memset(VIZ.peaks, 0, sizeof(VIZ.peaks));
@@ -282,10 +334,13 @@ static pthread_t g_viz_thread;
 static bool      g_viz_thread_running = false;
 
 static void stop_viz() {
+    if (!g_viz_thread_running && VIZ.ffmpeg_pid <= 0) return;
+    // Signal thread to stop, then close the pipe — closing the read end
+    // causes select() to return an error/EOF immediately, unblocking the thread
+    // without any sleep or arbitrary timeout.
     VIZ.running = false;
+    if (VIZ.pipe_fd >= 0) { close(VIZ.pipe_fd); VIZ.pipe_fd = -1; }
     if (g_viz_thread_running) {
-        // Close pipe to unblock the reader
-        if (VIZ.pipe_fd >= 0) { close(VIZ.pipe_fd); VIZ.pipe_fd = -1; }
         pthread_join(g_viz_thread, NULL);
         g_viz_thread_running = false;
     }
@@ -297,23 +352,17 @@ static void stop_viz() {
 }
 
 static void start_viz(double seek_pos) {
-    // Only start visualizer when there are no chapters
     if (!G.chapters.empty()) return;
-
     stop_viz();
 
-    // pipe: ffmpeg writes PCM → we read
     int pipefd[2];
     if (pipe(pipefd) < 0) return;
 
     pid_t pid = fork();
     if (pid == 0) {
-        // Child: ffmpeg raw PCM to stdout
         close(pipefd[0]);
         dup2(pipefd[1], STDOUT_FILENO);
         close(pipefd[1]);
-
-        // Silence stderr
         int devnull = open("/dev/null", O_WRONLY);
         dup2(devnull, STDERR_FILENO);
         close(devnull);
@@ -321,11 +370,12 @@ static void start_viz(double seek_pos) {
         char ss_buf[32];
         snprintf(ss_buf, sizeof(ss_buf), "%.2f", seek_pos);
 
-        // Decode: 8kHz mono signed 16-bit little-endian raw PCM
-        // ar=8000 is the key knob for CPU — very low sample rate
+        // Decode to raw PCM: 8kHz mono s16le
+        // -vn: skip video streams (faster startup)
         execlp("ffmpeg", "ffmpeg",
                "-ss", ss_buf,
                "-i", G.filepath.c_str(),
+               "-vn",
                "-f", "s16le",
                "-ac", "1",
                "-ar", "8000",
@@ -334,11 +384,10 @@ static void start_viz(double seek_pos) {
         _exit(1);
     }
 
-    close(pipefd[1]);  // parent only reads
+    close(pipefd[1]);
     VIZ.ffmpeg_pid = pid;
     VIZ.pipe_fd    = pipefd[0];
     VIZ.running    = true;
-
     pthread_create(&g_viz_thread, NULL, viz_thread, NULL);
     g_viz_thread_running = true;
 }
@@ -372,9 +421,9 @@ static void spawn_ffplay(double seek_pos) {
                (char*)NULL);
         _exit(1);
     }
-    G.ffplay_pid     = pid;
-    PC.start_pos     = seek_pos;
-    PC.paused        = false;
+    G.ffplay_pid  = pid;
+    PC.start_pos  = seek_pos;
+    PC.paused     = false;
     clock_gettime(CLOCK_MONOTONIC, &PC.start_wall);
 }
 
@@ -396,7 +445,6 @@ static void do_pause() {
     PC.pause_pos = estimated_position();
     PC.paused    = true;
     kill(G.ffplay_pid, SIGSTOP);
-    // Also pause the visualizer ffmpeg
     if (VIZ.ffmpeg_pid > 0) kill(VIZ.ffmpeg_pid, SIGSTOP);
     G.playing = false;
 }
@@ -425,10 +473,7 @@ static void do_seek(double new_pos) {
     G.current_chapter = find_chapter(G.chapters, new_pos);
     spawn_ffplay(new_pos);
     start_viz(new_pos);
-    if (!G.playing) {
-        usleep(80000);
-        do_pause();
-    }
+    if (!G.playing) { usleep(80000); do_pause(); }
 }
 
 // ─── Volume ───────────────────────────────────────────────────────────────────
@@ -449,77 +494,69 @@ static void maybe_apply_volume() {
                + (now.tv_nsec - g_vol_dirty.tv_nsec) / 1e9;
     if (age < 0.5) return;
     g_vol_pending = false;
-    double pos = estimated_position();
-    spawn_ffplay(pos);
-    // Note: viz does not need restart for volume — it reads separate process
+    spawn_ffplay(estimated_position());
     if (!G.playing) { usleep(80000); do_pause(); }
 }
 
 // ─── UI ───────────────────────────────────────────────────────────────────────
 
 static void draw_viz(int start_row, int end_row, int cols) {
-    // How many rows available for the visualizer
     int viz_rows = end_row - start_row;
     if (viz_rows < 2 || cols < NUM_BANDS * 2) return;
 
-    // Copy band data under lock
     float bands[NUM_BANDS], peaks[NUM_BANDS];
     pthread_mutex_lock(&VIZ.mu);
     memcpy(bands, VIZ.bands, sizeof(bands));
     memcpy(peaks, VIZ.peaks, sizeof(peaks));
     pthread_mutex_unlock(&VIZ.mu);
 
-    // Each band gets equal width, bars drawn vertically bottom-up
     int band_w = (cols - 2) / NUM_BANDS;
     if (band_w < 1) band_w = 1;
 
+    // Draw freq labels on the very last row
+    int label_row = end_row - 1;
+    attron(COLOR_PAIR(3));
     for (int b = 0; b < NUM_BANDS; b++) {
         int bx = 1 + b * band_w;
-        int bar_h    = (int)(bands[b] * viz_rows);
-        int peak_row = (int)((1.0f - peaks[b]) * (viz_rows - 1));
-        if (peak_row < 0)          peak_row = 0;
-        if (peak_row >= viz_rows)  peak_row = viz_rows - 1;
+        if (band_w >= 3)
+            mvaddstr(label_row, bx, BAND_LABELS[b]);
+    }
+    attroff(COLOR_PAIR(3));
 
-        for (int r = 0; r < viz_rows; r++) {
-            int screen_row = end_row - 1 - r;  // bottom = row 0
-            bool filled = (r < bar_h);
-            bool is_peak = (r == (viz_rows - 1 - peak_row));
+    // Draw bars in rows start_row .. end_row-2 (above the labels)
+    int bar_rows = viz_rows - 1;
+    if (bar_rows < 1) return;
+
+    for (int b = 0; b < NUM_BANDS; b++) {
+        int bx      = 1 + b * band_w;
+        int bar_h   = (int)(bands[b] * bar_rows + 0.5f);
+        int peak_r  = (int)(peaks[b] * bar_rows + 0.5f);
+        if (bar_h  > bar_rows) bar_h  = bar_rows;
+        if (peak_r > bar_rows) peak_r = bar_rows;
+
+        for (int r = 0; r < bar_rows; r++) {
+            int screen_row = start_row + bar_rows - 1 - r;
+            bool filled   = (r < bar_h);
+            bool is_peak  = (r == peak_r && peaks[b] > 0.03f);
 
             for (int c = 0; c < band_w - 1; c++) {
-                if (is_peak && peaks[b] > 0.02f) {
+                if (is_peak) {
                     attron(COLOR_PAIR(1) | A_BOLD);
                     mvaddch(screen_row, bx + c, '-');
                     attroff(COLOR_PAIR(1) | A_BOLD);
                 } else if (filled) {
-                    // Color gradient: green (low) → yellow (mid) → cyan (high)
-                    int pair;
-                    if (bands[b] < 0.4f)      pair = 2;  // green
-                    else if (bands[b] < 0.75f) pair = 4;  // yellow
-                    else                       pair = 1;  // cyan
+                    int pair = (bands[b] < 0.4f) ? 2
+                             : (bands[b] < 0.75f) ? 4
+                             : 1;
                     attron(COLOR_PAIR(pair));
                     mvaddch(screen_row, bx + c, ACS_BLOCK);
                     attroff(COLOR_PAIR(pair));
                 } else {
-                    attron(COLOR_PAIR(3));
                     mvaddch(screen_row, bx + c, ' ');
-                    attroff(COLOR_PAIR(3));
                 }
             }
         }
     }
-
-    // Label row just above bottom: show frequency labels lightly
-    attron(COLOR_PAIR(3));
-    const char* labels[NUM_BANDS] = {
-        "100","200","350","550","800","1k1","1k5","2k","2k7","3k4"
-    };
-    for (int b = 0; b < NUM_BANDS; b++) {
-        int bx = 1 + b * band_w;
-        // Only print if we have room (band_w >= 3)
-        if (band_w >= 3)
-            mvaddstr(end_row - 1, bx, labels[b]);
-    }
-    attroff(COLOR_PAIR(3));
 }
 
 static void draw_ui() {
@@ -530,14 +567,14 @@ static void draw_ui() {
 
     double pos = G.position;
 
-    // ── Row 0: title ──────────────────────────────────────────────────────────
+    // Row 0: title
     attron(COLOR_PAIR(1) | A_BOLD);
     mvhline(0, 0, ' ', cols);
     std::string status = G.playing ? " [>] " : " [||] ";
     mvaddutf8(0, 0, trunc_display(status + G.filename, cols - 1));
     attroff(COLOR_PAIR(1) | A_BOLD);
 
-    // ── Row 1: time + chapter name ────────────────────────────────────────────
+    // Row 1: time + chapter name
     std::string time_str = " " + fmt_time(pos) + " / " + fmt_time(G.duration);
     attron(COLOR_PAIR(5));
     mvaddutf8(1, 0, time_str);
@@ -549,26 +586,23 @@ static void draw_ui() {
         if (avail > 4) {
             ch_str = trunc_display(ch_str, avail);
             int x  = cols - display_width(ch_str) - 1;
-            if (x > display_width(time_str) + 2)
-                mvaddutf8(1, x, ch_str);
+            if (x > display_width(time_str) + 2) mvaddutf8(1, x, ch_str);
         }
     }
     attroff(COLOR_PAIR(5));
 
-    // ── Row 2: progress bar ───────────────────────────────────────────────────
+    // Row 2: progress bar
     int bar_x = 1, bar_w = cols - 2;
     if (bar_w > 0 && G.duration > 0) {
         double frac  = pos / G.duration;
         if (frac > 1) frac = 1;
         int filled = (int)(frac * bar_w);
-
         attron(COLOR_PAIR(2));
         for (int i = 0; i < filled && i < bar_w; i++) mvaddch(2, bar_x+i, ACS_BLOCK);
         attroff(COLOR_PAIR(2));
         attron(COLOR_PAIR(3));
         for (int i = filled; i < bar_w; i++) mvaddch(2, bar_x+i, ACS_HLINE);
         attroff(COLOR_PAIR(3));
-
         for (const auto& ch : G.chapters) {
             if (ch.start_time <= 0) continue;
             int mx = bar_x + (int)(ch.start_time / G.duration * bar_w);
@@ -578,7 +612,6 @@ static void draw_ui() {
                 attroff(COLOR_PAIR(4) | A_BOLD);
             }
         }
-
         int thumb = bar_x + filled;
         if (thumb >= bar_x + bar_w) thumb = bar_x + bar_w - 1;
         attron(COLOR_PAIR(1) | A_BOLD);
@@ -586,7 +619,7 @@ static void draw_ui() {
         attroff(COLOR_PAIR(1) | A_BOLD);
     }
 
-    // ── Row 3: volume bar ─────────────────────────────────────────────────────
+    // Row 3: volume bar
     {
         int vol_bar_w = cols / 3;
         if (vol_bar_w < 10) vol_bar_w = 10;
@@ -611,12 +644,11 @@ static void draw_ui() {
         attroff(COLOR_PAIR(5));
     }
 
-    // ── Rows 4 … rows-2: chapter list OR spectrum visualizer ─────────────────
+    // Rows 4..rows-2: chapters OR spectrum
     int content_start = 4;
-    int content_end   = rows - 2;  // leave row rows-1 for hints
+    int content_end   = rows - 2;
 
     if (!G.chapters.empty()) {
-        // Chapter list
         if (rows > 9) {
             attron(COLOR_PAIR(5));
             mvaddstr(content_start, 0, " Chapters:");
@@ -645,12 +677,11 @@ static void draw_ui() {
             }
         }
     } else {
-        // Spectrum visualizer
         if (content_end > content_start + 1)
             draw_viz(content_start, content_end, cols);
     }
 
-    // ── Bottom row: key hints ─────────────────────────────────────────────────
+    // Bottom hint row
     std::string hints = G.chapters.empty()
         ? " [<-/->] seek  [^/v] volume  [space] pause  [q] quit"
         : " [<-/->] seek  [^/v] volume  [space] pause  [s/w] chapter  [q] quit";
@@ -671,13 +702,9 @@ static void handle_sigchld(int) {
     pid_t p = waitpid(-1, &st, WNOHANG);
     if (p > 0 && p == G.ffplay_pid) {
         G.ffplay_pid = -1;
-        if (G.position >= G.duration - 2.0)
-            G.quit = true;
+        if (G.position >= G.duration - 2.0) G.quit = true;
     }
-    // Reap visualizer ffmpeg too if it exits naturally
-    if (p > 0 && p == VIZ.ffmpeg_pid) {
-        VIZ.ffmpeg_pid = -1;
-    }
+    if (p > 0 && p == VIZ.ffmpeg_pid) VIZ.ffmpeg_pid = -1;
 }
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
@@ -702,8 +729,8 @@ int main(int argc, char* argv[]) {
     G.playing      = true;
     VIZ.ffmpeg_pid = -1;
     VIZ.pipe_fd    = -1;
-    pthread_mutex_init(&G.lock,   NULL);
-    pthread_mutex_init(&VIZ.mu,   NULL);
+    pthread_mutex_init(&G.lock, NULL);
+    pthread_mutex_init(&VIZ.mu, NULL);
 
     G.filepath = argv[1];
     G.filename = basename_of(G.filepath);
@@ -747,45 +774,26 @@ int main(int argc, char* argv[]) {
     signal(SIGCHLD,  handle_sigchld);
 
     spawn_ffplay(0.0);
-    start_viz(0.0);   // no-op if file has chapters
+    start_viz(0.0);
 
     while (!G.quit) {
         if (G.ffplay_pid > 0) {
             G.position        = estimated_position();
             G.current_chapter = find_chapter(G.chapters, G.position);
         }
-
         maybe_apply_volume();
-
-        if (g_resize) {
-            g_resize = false;
-            endwin(); refresh(); clear();
-        }
-
+        if (g_resize) { g_resize = false; endwin(); refresh(); clear(); }
         draw_ui();
 
         int ch = getch();
         if (ch == ERR) continue;
-
         switch (ch) {
-            case 'q': case 'Q':
-                G.quit = true;
-                break;
-            case ' ':
-                do_toggle_pause();
-                break;
-            case KEY_RIGHT:
-                do_seek(G.position + 10.0);
-                break;
-            case KEY_LEFT:
-                do_seek(G.position - 10.0);
-                break;
-            case KEY_UP:
-                do_volume_change(+5);
-                break;
-            case KEY_DOWN:
-                do_volume_change(-5);
-                break;
+            case 'q': case 'Q': G.quit = true; break;
+            case ' ':           do_toggle_pause(); break;
+            case KEY_RIGHT:     do_seek(G.position + 10.0); break;
+            case KEY_LEFT:      do_seek(G.position - 10.0); break;
+            case KEY_UP:        do_volume_change(+5); break;
+            case KEY_DOWN:      do_volume_change(-5); break;
             case 's': case 'S':
                 if (!G.chapters.empty()) {
                     int nx = G.current_chapter + 1;

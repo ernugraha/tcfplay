@@ -2,9 +2,9 @@ CXX      = g++
 CXXFLAGS = -O2 -Wall -std=c++11
 LDFLAGS  = -lncursesw -lpthread
 
-TARGET = tplay
+TARGET = tcfplay
 
-$(TARGET): tplay.cpp
+$(TARGET): tcfplay.cpp
 	$(CXX) $(CXXFLAGS) -o $(TARGET) tplay.cpp $(LDFLAGS)
 
 install: $(TARGET)
