@@ -1,4 +1,5 @@
-# tplay — Terminal Media Player
+# TCF — Terminal Media Player
+**T**he **C**ringe **F**u**ing Media Player
 
 A lightweight terminal audio player powered by ffplay.
 Designed to run comfortably on old hardware (2011 PCs and up).
@@ -20,7 +21,7 @@ are fully supported.
  > 2. 第二章 - Bridge   [3:30]
    3. Chorus            [7:00]
    4. Outro             [11:00]
- [<-/->] seek 10s   [i] next ch   [k] prev ch   [q] quit
+ [<-/->] seek 10s   [s] next ch   [w] prev ch   [q] quit
 ```
 
 - Top bar: filename (safely truncated for wide CJK characters)
@@ -78,7 +79,7 @@ g++ -O2 -std=c++11 -o tplay tplay.cpp -lncursesw -lpthread
 |---|---|
 | `→` Right arrow | Seek forward 10 seconds |
 | `←` Left arrow  | Seek backward 10 seconds |
-| `i` | Jump to next chapter |
+| `s` | Jump to next chapter |
 | `k` | Jump to previous chapter |
 | `q` | Quit |
 
