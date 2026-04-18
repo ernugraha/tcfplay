@@ -5,7 +5,7 @@ LDFLAGS  = -lncursesw -lpthread
 TARGET = tcfplay
 
 $(TARGET): tcfplay.cpp
-	$(CXX) $(CXXFLAGS) -o $(TARGET) tplay.cpp $(LDFLAGS)
+	$(CXX) $(CXXFLAGS) -o $(TARGET) tcfplay.cpp $(LDFLAGS)
 
 install: $(TARGET)
 	cp $(TARGET) /usr/local/bin/
