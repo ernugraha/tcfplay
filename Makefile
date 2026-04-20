@@ -4,7 +4,7 @@ LDFLAGS  = -lncursesw -lpthread
 
 TARGET  = tcfplay
 VERSION = 2026.4
-ARCH    = amd64
+ARCH    = $(shell dpkg --print-architecture)
 DEBDIR  = $(TARGET)_$(VERSION)_$(ARCH)
 
 $(TARGET): tcfplay.cpp
